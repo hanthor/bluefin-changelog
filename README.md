@@ -2,8 +2,6 @@
 
 Shows the pending update changelog for [Project Bluefin](https://projectbluefin.io) images — diffing your currently booted image against the staged update using GitHub release notes and attached SPDX SBOMs.
 
-![screenshot](https://github.com/hanthor/bluefin-changelog/assets/screenshot.png)
-
 ## What it does
 
 1. Reads `bootc status` to find your booted and staged image digests
