@@ -1,0 +1,954 @@
+#!/usr/bin/env python3
+"""Show pending Bluefin Dakota update changelog with rich TUI or HTML output."""
+
+import argparse
+import html as html_mod
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime, timedelta
+
+from rich.console import Console, Group
+from rich.panel import Panel
+from rich.table import Table
+from rich import box
+from rich.text import Text
+from rich.rule import Rule
+
+REPO = "projectbluefin/dakota"
+API_BASE = "https://api.github.com/repos"
+HASH_RE = re.compile(r'^[0-9a-f]{40,}$')
+INTERESTING_SOURCES = {"git_repo", "tar", "remote", "zip", "docker"}
+
+DAKOTA_IMG = "https://docs.projectbluefin.io/assets/images/dakotaraptor-debfce4b1b8f804ed609386a7bbbd635.webp"
+
+# ── Per-component link resolver ───────────────────────────────────────────────
+#  Each entry: release_url(ver) and compare_url(old, new)
+def _gh(repo, tag=lambda v: f"v{v}"):
+    return {
+        "release": lambda v: f"https://github.com/{repo}/releases/tag/{tag(v)}",
+        "compare":  lambda o, n: f"https://github.com/{repo}/compare/{tag(o)}...{tag(n)}",
+    }
+
+def _gl(host, repo, tag=lambda v: v):
+    return {
+        "release": lambda v: f"https://{host}/{repo}/-/releases/{tag(v)}",
+        "compare":  lambda o, n: f"https://{host}/{repo}/-/compare/{tag(o)}...{tag(n)}",
+    }
+
+COMPONENT_LINKS = {
+    "Kernel": {
+        # kernelnewbies for major bumps; kernel.org changelog for stable patches
+        "release": lambda v: (
+            f"https://kernelnewbies.org/Linux_{'.'.join(v.split('.')[:2])}"
+        ),
+        "compare": lambda o, n: (
+            f"https://kernelnewbies.org/Linux_{'.'.join(n.split('.')[:2])}"
+            if o.split('.')[0] != n.split('.')[0]
+            else f"https://cdn.kernel.org/pub/linux/kernel/v{n.split('.')[0]}.x/ChangeLog-{n}"
+        ),
+    },
+    "GNOME":        {"release": lambda v: f"https://release.gnome.org/",
+                     "compare":  lambda o, n: f"https://release.gnome.org/"},
+    "Mesa":         _gl("gitlab.freedesktop.org", "mesa/mesa",   lambda v: f"mesa-{v}"),
+    "Podman":       _gh("containers/podman"),
+    "bootc":        _gh("containers/bootc"),
+    "systemd":      _gh("systemd/systemd"),
+    "pipewire":     _gl("gitlab.freedesktop.org", "pipewire/pipewire"),
+    "flatpak":      _gh("flatpak/flatpak",         lambda v: v),   # no v prefix
+    "sudo-rs": {
+        # version is a commit sha — link to the commit
+        "release": lambda v: f"https://github.com/trifectatechfoundation/sudo-rs/commit/{v}",
+        "compare":  lambda o, n: f"https://github.com/trifectatechfoundation/sudo-rs/compare/{o}...{n}",
+    },
+    "uutils":       _gh("uutils/coreutils"),
+    "distrobox":    _gh("89luca89/distrobox",      lambda v: v),
+    "ghostty":      _gh("ghostty-org/ghostty"),
+    "fish":         _gh("fish-shell/fish-shell",   lambda v: v),
+    "common": {
+        "release": lambda v: f"https://github.com/ublue-os/config/releases",
+        "compare":  lambda o, n: f"https://github.com/ublue-os/config/releases",
+    },
+    "JetBrains Mono": _gh("JetBrains/JetBrainsMono"),
+    "gum":          _gh("charmbracelet/gum"),
+    "fzf":          _gh("junegunn/fzf"),
+    "glow":         _gh("charmbracelet/glow"),
+}
+
+def component_url(name, ver, old_ver=None):
+    """Return the best URL for a component chip — compare if changed, release otherwise."""
+    info = COMPONENT_LINKS.get(name)
+    if not info:
+        return None
+    if old_ver and old_ver != ver:
+        return info["compare"](old_ver, ver)
+    return info["release"](ver)
+
+
+# ── CSS stolen from docs.projectbluefin.io ────────────────────────────────────
+HTML_CSS = """
+/* Infima base variables */
+:root {
+  --ifm-color-primary: #3578e5;
+  --ifm-color-primary-lightest: #9abcf2;
+  --ifm-color-emphasis-100: #f5f6f7;
+  --ifm-color-emphasis-200: #ebedf0;
+  --ifm-color-emphasis-300: #dadde1;
+  --ifm-color-emphasis-400: #c8ccd0;
+  --ifm-color-emphasis-600: #8d949e;
+  --ifm-color-emphasis-700: #606770;
+  --ifm-color-emphasis-900: #1c1e21;
+  --ifm-background-color: #ffffff;
+  --ifm-background-surface-color: #f5f6f7;
+  --ifm-font-family-base: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif;
+  --ifm-font-family-monospace: SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ifm-color-primary: #8a97f7;
+    --ifm-color-primary-lightest: rgba(138,151,247,.2);
+    --ifm-color-emphasis-100: #2a2a2e;
+    --ifm-color-emphasis-200: #343438;
+    --ifm-color-emphasis-300: #454549;
+    --ifm-color-emphasis-400: #5a5a60;
+    --ifm-color-emphasis-600: #9a9aa6;
+    --ifm-color-emphasis-700: #c0c0cc;
+    --ifm-color-emphasis-900: #e8e8ee;
+    --ifm-background-color: #1b1b1d;
+    --ifm-background-surface-color: #242526;
+  }
+}
+
+/* ── Reset & page ── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: var(--ifm-font-family-base);
+  background: var(--ifm-background-color);
+  color: var(--ifm-color-emphasis-900);
+  line-height: 1.6;
+  font-size: 15px;
+}
+a { color: var(--ifm-color-primary); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ── Layout ── */
+.page {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem 4rem;
+}
+
+/* ── Page header (stolen from feedSectionHeading) ── */
+.page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 2rem;
+  padding-bottom: 1.25rem;
+  border-bottom: 2px solid var(--ifm-color-emphasis-200);
+}
+.page-header-left { flex: 1; min-width: 0; }
+.page-title {
+  color: var(--ifm-color-primary);
+  font-size: 1.8rem;
+  font-weight: 800;
+  line-height: 1.2;
+  margin-bottom: .35rem;
+}
+.page-subtitle {
+  color: var(--ifm-color-emphasis-600);
+  font-size: .88rem;
+}
+.page-header-right img {
+  width: 96px;
+  height: 96px;
+  object-fit: contain;
+  flex-shrink: 0;
+  opacity: .9;
+}
+
+/* current → staged digest row */
+.digest-row {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  margin-top: .6rem;
+  font-size: .8rem;
+  color: var(--ifm-color-emphasis-600);
+  flex-wrap: wrap;
+}
+.digest-row .tag {
+  font-family: var(--ifm-font-family-monospace);
+  background: var(--ifm-color-emphasis-100);
+  border: 1px solid var(--ifm-color-emphasis-200);
+  border-radius: 4px;
+  padding: .1rem .4rem;
+  font-size: .75rem;
+}
+.digest-row .arrow { color: #7c3aed; font-weight: 700; font-size: 1rem; }
+.digest-row .date { font-weight: 600; color: var(--ifm-color-emphasis-900); }
+
+/* ── Section headings (feedSectionHeading_WYiK) ── */
+.section-heading {
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--ifm-color-emphasis-600);
+  border-bottom: 2px solid var(--ifm-color-emphasis-200);
+  margin: 0 0 1rem;
+  padding-bottom: .5rem;
+  font-size: .85rem;
+  font-weight: 700;
+}
+.section { margin-bottom: 2.5rem; }
+
+/* ── Version chips (versionChip_TGoY) ── */
+.chipsRow_wIOg {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .45rem;
+}
+.versionChip_TGoY {
+  background: var(--ifm-color-emphasis-100);
+  border: 1px solid var(--ifm-color-emphasis-200);
+  border-radius: 6px;
+  align-items: center;
+  gap: .3rem;
+  padding: .25rem .6rem;
+  font-size: .82rem;
+  display: inline-flex;
+  transition: box-shadow .15s, border-color .15s;
+}
+a.versionChip_TGoY {
+  text-decoration: none;
+  cursor: pointer;
+}
+a.versionChip_TGoY:hover {
+  border-color: var(--ifm-color-emphasis-400);
+  box-shadow: 0 2px 8px rgba(0,0,0,.1);
+  text-decoration: none;
+}
+.chipChanged_q9Uf {
+  background: rgba(234,179,8,.1);
+  border-color: rgba(234,179,8,.5);
+}
+a.chipChanged_q9Uf:hover {
+  border-color: #d97706;
+  box-shadow: 0 2px 8px rgba(217,119,6,.2);
+}
+.chipLabel_jCCv {
+  color: var(--ifm-color-emphasis-700);
+  font-weight: 600;
+}
+.chipValue_k66W {
+  color: var(--ifm-color-emphasis-900);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: .76rem;
+}
+.chipOld_vZzQ {
+  color: var(--ifm-color-emphasis-600);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: .73rem;
+  text-decoration: line-through;
+  opacity: .75;
+}
+.chipUpdated_MZXy {
+  color: #d97706;
+  font-size: .72rem;
+  font-weight: 700;
+}
+
+/* ── SBOM note ── */
+.sbom-note {
+  background: rgba(234,179,8,.07);
+  border: 1px solid rgba(234,179,8,.3);
+  border-left: 3px solid #d97706;
+  border-radius: 0 6px 6px 0;
+  padding: .6rem 1rem;
+  font-size: .83rem;
+  color: var(--ifm-color-emphasis-700);
+  margin-bottom: 1.25rem;
+}
+.sbom-note code {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: .78rem;
+  background: var(--ifm-color-emphasis-100);
+  border: 1px solid var(--ifm-color-emphasis-200);
+  border-radius: 3px;
+  padding: .05rem .3rem;
+}
+
+/* ── Package diff tables ── */
+.diff-block { margin-bottom: 2rem; }
+.diff-block-heading {
+  font-size: .8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--ifm-color-emphasis-600);
+  margin-bottom: .5rem;
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+}
+.diff-count {
+  background: var(--ifm-color-emphasis-200);
+  border-radius: 10px;
+  padding: .05rem .45rem;
+  font-size: .72rem;
+  font-weight: 700;
+  color: var(--ifm-color-emphasis-700);
+}
+.diff-count.updated { background: rgba(234,179,8,.2); color: #92400e; }
+.diff-count.added   { background: rgba(0,164,0,.12);  color: #14532d; }
+.diff-count.removed { background: rgba(250,56,62,.12); color: #7f1d1d; }
+@media (prefers-color-scheme: dark) {
+  .diff-count.updated { background: rgba(234,179,8,.15); color: #fcd34d; }
+  .diff-count.added   { background: rgba(0,164,0,.15);   color: #86efac; }
+  .diff-count.removed { background: rgba(250,56,62,.12); color: #fca5a5; }
+}
+
+.diff-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: .82rem;
+}
+.diff-table th {
+  text-align: left;
+  padding: .35rem .6rem;
+  border-bottom: 2px solid var(--ifm-color-emphasis-200);
+  font-size: .73rem;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--ifm-color-emphasis-600);
+  font-weight: 700;
+}
+.diff-table td {
+  padding: .3rem .6rem;
+  border-bottom: 1px solid var(--ifm-color-emphasis-100);
+  vertical-align: middle;
+}
+.diff-table tr:last-child td { border-bottom: none; }
+.diff-table tr:hover td { background: var(--ifm-color-emphasis-100); }
+.pkg-name { font-weight: 600; color: var(--ifm-color-emphasis-900); }
+.ver-old  { font-family: var(--ifm-font-family-monospace); font-size: .76rem;
+            color: #b91c1c; text-decoration: line-through; opacity: .75; }
+.ver-new  { font-family: var(--ifm-font-family-monospace); font-size: .76rem;
+            color: #15803d; font-weight: 600; }
+.ver-add  { font-family: var(--ifm-font-family-monospace); font-size: .76rem;
+            color: #15803d; }
+.ver-rem  { font-family: var(--ifm-font-family-monospace); font-size: .76rem;
+            color: #b91c1c; opacity: .75; }
+@media (prefers-color-scheme: dark) {
+  .ver-old, .ver-rem { color: #fca5a5; }
+  .ver-new, .ver-add { color: #86efac; }
+}
+.diff-link {
+  font-size: .72rem;
+  color: var(--ifm-color-emphasis-600);
+  white-space: nowrap;
+}
+.diff-link a {
+  color: var(--ifm-color-primary);
+  border: 1px solid var(--ifm-color-primary-lightest);
+  border-radius: 3px;
+  padding: .05rem .35rem;
+  font-size: .72rem;
+}
+.diff-link a:hover { background: var(--ifm-color-primary-lightest); text-decoration: none; }
+
+/* ── Footer links (cardFooter_U6Ao / viewLink_xgng) ── */
+.page-footer {
+  border-top: 1px solid var(--ifm-color-emphasis-200);
+  padding-top: 1rem;
+  display: flex;
+  justify-content: flex-end;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+.viewLink_xgng {
+  color: var(--ifm-color-primary);
+  border: 1px solid var(--ifm-color-primary-lightest);
+  border-radius: 4px;
+  padding: .3rem .75rem;
+  font-size: .85rem;
+  font-weight: 500;
+  text-decoration: none;
+}
+.viewLink_xgng:hover {
+  background: var(--ifm-color-primary-lightest);
+  text-decoration: none;
+}
+"""
+
+
+# ── Data helpers ──────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Show Bluefin Dakota pending update changelog")
+    p.add_argument("--html", metavar="FILE", help="Export to HTML file instead of terminal")
+    return p.parse_args()
+
+
+def get_bootc_status():
+    r = subprocess.run(["sudo", "bootc", "status", "--format", "json"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print("Error: could not run 'sudo bootc status'", file=sys.stderr)
+        sys.exit(1)
+    return json.loads(r.stdout)
+
+
+CACHE_DIR = os.path.expanduser("~/.cache/bluefin-changelog")
+
+def _cache_path(key):
+    safe = re.sub(r'[^a-zA-Z0-9_.-]', '_', key)
+    return os.path.join(CACHE_DIR, safe + ".json")
+
+def _cache_get(key, max_age_s=3600):
+    path = _cache_path(key)
+    try:
+        if time.time() - os.path.getmtime(path) < max_age_s:
+            with open(path) as f:
+                return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return None
+
+def _cache_put(key, data):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(_cache_path(key), "w") as f:
+        json.dump(data, f)
+
+def fetch_json(url, cache_key=None, max_age_s=3600):
+    if cache_key:
+        cached = _cache_get(cache_key, max_age_s)
+        if cached is not None:
+            return cached
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "bluefin-changelog/1.0", "Accept": "application/json"}
+    )
+    with urllib.request.urlopen(req) as resp:
+        data = json.loads(resp.read())
+    if cache_key:
+        _cache_put(cache_key, data)
+    return data
+
+
+def fetch_releases():
+    return fetch_json(f"{API_BASE}/{REPO}/releases?per_page=30",
+                      cache_key="releases", max_age_s=1800)
+
+
+def find_release_for_date(releases, date_str):
+    for r in releases:
+        if r["tag_name"].startswith(date_str):
+            return r
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    for delta in [1, -1, 2, -2, 3, -3, 4, -4]:
+        candidate = (dt + timedelta(days=delta)).strftime("%Y-%m-%d")
+        for r in releases:
+            if r["tag_name"].startswith(candidate):
+                return r
+    return None
+
+
+def download_sbom(release):
+    tag = release["tag_name"]
+    cached = _cache_get(f"sbom_{tag}", max_age_s=86400 * 7)
+    if cached is not None:
+        return cached
+    assets = fetch_json(release["assets_url"],
+                        cache_key=f"assets_{tag}", max_age_s=86400)
+    for asset in assets:
+        if asset["name"].endswith(".spdx.json"):
+            req = urllib.request.Request(
+                asset["browser_download_url"],
+                headers={"User-Agent": "bluefin-changelog/1.0"}
+            )
+            with urllib.request.urlopen(req) as resp:
+                data = json.loads(resp.read())
+            _cache_put(f"sbom_{tag}", data)
+            return data
+    return None
+
+
+def extract_packages(sbom):
+    pkgs = {}
+    for p in sbom.get("packages", []):
+        name = p.get("name", "")
+        ver = p.get("versionInfo", "")
+        src = p.get("sourceInfo", "")
+        if not ver or not name:
+            continue
+        if HASH_RE.match(ver) or HASH_RE.match(name):
+            continue
+        if name.startswith("/"):
+            continue
+        if src in INTERESTING_SOURCES or re.match(r'^\d+\.\d+', ver):
+            pkgs[name] = ver
+    return pkgs
+
+
+def parse_key_components(body):
+    components = {}
+    in_section = False
+    saw_table = False
+    for line in body.splitlines():
+        if "Key component versions" in line:
+            in_section = True
+            saw_table = False
+            continue
+        if not in_section:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("|") and "---" in stripped:
+            continue
+        if stripped.startswith("|") and "Component" in stripped:
+            saw_table = True
+            continue
+        if stripped.startswith("|"):
+            saw_table = True
+            parts = [p.strip() for p in stripped.strip("|").split("|")]
+            if len(parts) >= 3:
+                name = parts[0].strip()
+                ver = parts[1].strip().strip("`")
+                change = parts[2].strip()
+                if name and ver:
+                    components[name] = {"version": ver, "change": change}
+        elif saw_table and stripped == "":
+            in_section = False
+    return components
+
+
+def diff_packages(old_pkgs, new_pkgs):
+    added = {k: v for k, v in new_pkgs.items() if k not in old_pkgs}
+    removed = {k: v for k, v in old_pkgs.items() if k not in new_pkgs}
+    changed = {
+        k: (old_pkgs[k], new_pkgs[k])
+        for k in new_pkgs
+        if k in old_pkgs and old_pkgs[k] != new_pkgs[k]
+    }
+    return added, removed, changed
+
+
+def format_date(date_str):
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").strftime("%B %-d, %Y")
+    except Exception:
+        return date_str
+
+
+# ── HTML generation ───────────────────────────────────────────────────────────
+
+def h(s):
+    return html_mod.escape(str(s))
+
+
+def chip_html(name, ver, old_ver=None):
+    """Render a version chip, optionally as a link with old→new display."""
+    changed = old_ver is not None and old_ver != ver
+    url = component_url(name, ver, old_ver if changed else None)
+
+    classes = "versionChip_TGoY" + (" chipChanged_q9Uf" if changed else "")
+    old_span = (f'<span class="chipOld_vZzQ">{h(old_ver)}</span>' if changed else "")
+    arrow    = (f'<span class="chipUpdated_MZXy">↑</span>' if changed else "")
+
+    inner = (
+        f'<span class="chipLabel_jCCv">{h(name)}</span>'
+        f'{old_span}'
+        f'<span class="chipValue_k66W">{h(ver)}</span>'
+        f'{arrow}'
+    )
+    if url:
+        title = f"Compare {h(old_ver)} → {h(ver)}" if changed else f"Release notes for {h(ver)}"
+        return f'<a class="{classes}" href="{h(url)}" target="_blank" title="{title}">{inner}</a>'
+    return f'<span class="{classes}">{inner}</span>'
+
+
+def sbom_pkg_link(name):
+    """Best-effort link for an SBOM package name to its upstream."""
+    # Map common SBOM names → GitHub repos
+    SBOM_LINKS = {
+        "ghostty":   ("release", "ghostty-org/ghostty", lambda v: f"v{v}"),
+        "fish":      ("release", "fish-shell/fish-shell", lambda v: v),
+        "podman":    ("release", "containers/podman", lambda v: f"v{v}"),
+        "flatpak":   ("release", "flatpak/flatpak", lambda v: v),
+        "systemd":   ("release", "systemd/systemd", lambda v: f"v{v}"),
+        "fzf":       ("release", "junegunn/fzf", lambda v: f"v{v}"),
+        "gum":       ("release", "charmbracelet/gum", lambda v: f"v{v}"),
+        "glow":      ("release", "charmbracelet/glow", lambda v: f"v{v}"),
+        "distrobox": ("release", "89luca89/distrobox", lambda v: v),
+        "bootc":     ("release", "containers/bootc", lambda v: f"v{v}"),
+    }
+    return SBOM_LINKS.get(name.lower())
+
+
+def diff_section_html(label, count_class, rows_html, cols):
+    count = len(rows_html)
+    if not count:
+        return ""
+    thead = "".join(f"<th>{c}</th>" for c in cols)
+    tbody = "".join(rows_html)
+    return f"""
+<div class="diff-block">
+  <div class="diff-block-heading">
+    {h(label)}
+    <span class="diff-count {count_class}">{count}</span>
+  </div>
+  <table class="diff-table">
+    <thead><tr>{thead}</tr></thead>
+    <tbody>{tbody}</tbody>
+  </table>
+</div>"""
+
+
+def generate_html(
+    booted_date, staged_date, booted_digest, staged_digest,
+    staged_release, key_components,
+    changed, added, removed,
+    sbom_note, from_tag, to_tag,
+    output_path
+):
+    tag     = staged_release["tag_name"]
+    gh_url  = f"https://github.com/{REPO}/releases/tag/{tag}"
+    docs_url = "https://docs.projectbluefin.io/changelogs"
+
+    # ── Component chips ──
+    chips = []
+    for name, info in key_components.items():
+        ver    = info["version"]
+        change = info["change"]
+        if "→" in change:
+            old_ver = change.split("→")[0].strip().strip("`")
+            chips.append(chip_html(name, ver, old_ver=old_ver))
+        else:
+            chips.append(chip_html(name, ver))
+
+    # ── SBOM note banner ──
+    sbom_banner = ""
+    if sbom_note:
+        sbom_banner = (
+            f'<div class="sbom-note">'
+            f'<strong>⚠ SBOM baseline note:</strong> Your running image ({h(booted_date)}) '
+            f'predates the release automation — no SBOM exists for it. '
+            f'Diff shown is <code>{h(from_tag)}</code> → <code>{h(to_tag)}</code>, '
+            f'the nearest available baseline.'
+            f'</div>'
+        )
+
+    # ── Package diff tables ──
+
+    # Updated
+    updated_rows = []
+    for name in sorted(changed):
+        old, new = changed[name]
+        link_info = sbom_pkg_link(name)
+        link_cell = ""
+        if link_info:
+            _, repo, tag_fn = link_info
+            url = f"https://github.com/{repo}/compare/{tag_fn(old)}...{tag_fn(new)}"
+            link_cell = f'<a href="{h(url)}" target="_blank">diff ↗</a>'
+        updated_rows.append(
+            f'<tr>'
+            f'<td class="pkg-name">{h(name)}</td>'
+            f'<td class="ver-old">{h(old)}</td>'
+            f'<td class="ver-new">{h(new)}</td>'
+            f'<td class="diff-link">{link_cell}</td>'
+            f'</tr>'
+        )
+
+    # Added
+    added_rows = []
+    for name in sorted(added):
+        ver = added[name]
+        link_info = sbom_pkg_link(name)
+        link_cell = ""
+        if link_info:
+            _, repo, tag_fn = link_info
+            url = f"https://github.com/{repo}/releases/tag/{tag_fn(ver)}"
+            link_cell = f'<a href="{h(url)}" target="_blank">release ↗</a>'
+        added_rows.append(
+            f'<tr>'
+            f'<td class="pkg-name">{h(name)}</td>'
+            f'<td class="ver-add">{h(ver)}</td>'
+            f'<td class="diff-link">{link_cell}</td>'
+            f'</tr>'
+        )
+
+    # Removed
+    removed_rows = []
+    for name in sorted(removed):
+        removed_rows.append(
+            f'<tr>'
+            f'<td class="pkg-name">{h(name)}</td>'
+            f'<td class="ver-rem">{h(removed[name])}</td>'
+            f'<td class="diff-link"></td>'
+            f'</tr>'
+        )
+
+    diff_html = ""
+    if not updated_rows and not added_rows and not removed_rows:
+        diff_html = '<p style="color:var(--ifm-color-emphasis-600);font-size:.85rem">No package differences found between the two SBOMs.</p>'
+    else:
+        diff_html += diff_section_html("Updated", "updated", updated_rows, ["Package", "Old", "New", ""])
+        diff_html += diff_section_html("Added",   "added",   added_rows,   ["Package", "Version", ""])
+        diff_html += diff_section_html("Removed", "removed", removed_rows, ["Package", "Version", ""])
+
+    page = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bluefin Dakota — Pending Update {h(tag)}</title>
+<style>{HTML_CSS}</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- ── Page header ── -->
+  <header class="page-header">
+    <div class="page-header-left">
+      <h1 class="page-title">Bluefin Dakota</h1>
+      <p class="page-subtitle">Pending update — {h(format_date(staged_date))}</p>
+      <div class="digest-row">
+        <span class="date">{h(booted_date)}</span>
+        <span class="tag">{h(booted_digest)}…</span>
+        <span class="arrow">→</span>
+        <span class="date">{h(staged_date)}</span>
+        <span class="tag">{h(staged_digest)}…</span>
+        <span style="margin-left:.25rem">
+          <a href="{h(gh_url)}" target="_blank" style="font-size:.75rem">{h(tag)}</a>
+        </span>
+      </div>
+    </div>
+    <img src="{DAKOTA_IMG}" alt="Dakotaraptor" width="96" height="96">
+  </header>
+
+  <!-- ── Component versions ── -->
+  <section class="section">
+    <h2 class="section-heading">Component Versions</h2>
+    <div class="chipsRow_wIOg">
+      {"".join(chips)}
+    </div>
+    <p style="margin-top:.75rem;font-size:.75rem;color:var(--ifm-color-emphasis-600)">
+      Highlighted chips have changed — click to view the diff or changelog.
+    </p>
+  </section>
+
+  <!-- ── Package diff ── -->
+  <section class="section">
+    <h2 class="section-heading">Package Diff (SBOM)</h2>
+    {sbom_banner}
+    {diff_html}
+  </section>
+
+  <!-- ── Footer ── -->
+  <div class="page-footer">
+    <a href="{docs_url}" class="viewLink_xgng" target="_blank">Full changelog →</a>
+    <a href="{h(gh_url)}" class="viewLink_xgng" target="_blank">View on GitHub →</a>
+  </div>
+
+</div>
+</body>
+</html>"""
+
+    with open(output_path, "w") as f:
+        f.write(page)
+    print(f"HTML written to {output_path}")
+
+
+# ── Rich TUI helpers ──────────────────────────────────────────────────────────
+
+def build_header_panel(booted_date, staged_date, booted_digest, staged_digest):
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="dim")
+    t.add_column()
+    t.add_row("Current", f"[cyan]{booted_date}[/cyan]  [dim]{booted_digest}…[/dim]")
+    t.add_row("Staged",  f"[green bold]{staged_date}[/green bold]  [dim]{staged_digest}…[/dim]")
+    return Panel(t, title="[bold]Bluefin Dakota — Pending Update[/bold]",
+                 border_style="blue", padding=(1, 2))
+
+
+def build_components_table(key_components):
+    t = Table(box=box.ROUNDED, border_style="dim", show_header=True, header_style="bold")
+    t.add_column("Component", style="bold cyan", min_width=18)
+    t.add_column("Version", min_width=12)
+    t.add_column("Change", min_width=30)
+    for comp, info in key_components.items():
+        ver = info["version"]
+        change = info["change"]
+        if "→" in change:
+            old_ver = change.split("→")[0].strip().strip("`")
+            new_ver = change.split("→")[1].strip().strip("`")
+            ct = Text()
+            ct.append(old_ver, style="dim red strike")
+            ct.append(" → ", style="dim")
+            ct.append(new_ver, style="green bold")
+            t.add_row(comp, ver, ct)
+        else:
+            t.add_row(comp, f"[dim]{ver}[/dim]", Text("—", style="dim"))
+    return t
+
+
+def build_diff_panels(changed, added, removed):
+    panels = []
+    if changed:
+        t = Table(box=box.SIMPLE_HEAD, header_style="bold yellow", show_header=True)
+        t.add_column("Package", style="bold", min_width=30)
+        t.add_column("Old", style="dim red", min_width=18)
+        t.add_column("New", style="green bold", min_width=18)
+        for name in sorted(changed):
+            old, new = changed[name]
+            panels_row_old = (old[:24] + "…") if len(old) > 26 else old
+            panels_row_new = (new[:24] + "…") if len(new) > 26 else new
+            t.add_row(name, panels_row_old, panels_row_new)
+        panels.append(Panel(t, title=f"[yellow bold]Updated ({len(changed)})[/yellow bold]",
+                            border_style="yellow"))
+    if added:
+        t = Table(box=box.SIMPLE_HEAD, header_style="bold green", show_header=True)
+        t.add_column("Package", style="bold", min_width=30)
+        t.add_column("Version", style="green", min_width=18)
+        for name in sorted(added)[:40]:
+            t.add_row(name, added[name])
+        if len(added) > 40:
+            t.add_row(f"[dim]… and {len(added) - 40} more[/dim]", "")
+        panels.append(Panel(t, title=f"[green bold]Added ({len(added)})[/green bold]",
+                            border_style="green"))
+    if removed:
+        t = Table(box=box.SIMPLE_HEAD, header_style="bold red", show_header=True)
+        t.add_column("Package", style="bold", min_width=30)
+        t.add_column("Version", style="dim red", min_width=18)
+        for name in sorted(removed)[:40]:
+            t.add_row(name, removed[name])
+        if len(removed) > 40:
+            t.add_row(f"[dim]… and {len(removed) - 40} more[/dim]", "")
+        panels.append(Panel(t, title=f"[red bold]Removed ({len(removed)})[/red bold]",
+                            border_style="red"))
+    return panels
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    args = parse_args()
+    console = Console()
+
+    with console.status("[bold blue]Querying bootc status…"):
+        status = get_bootc_status()
+
+    booted = status["status"].get("booted", {})
+    staged = status["status"].get("staged", {})
+
+    if not staged:
+        console.print(Panel("[green]No staged update — you are up to date.[/green]",
+                            border_style="green"))
+        return
+
+    booted_ts    = booted.get("image", {}).get("timestamp", "")
+    staged_ts    = staged.get("image", {}).get("timestamp", "")
+    booted_digest = booted.get("image", {}).get("imageDigest", "").removeprefix("sha256:")[:20]
+    staged_digest = staged.get("image", {}).get("imageDigest", "").removeprefix("sha256:")[:20]
+    booted_date  = booted_ts[:10] if booted_ts else "unknown"
+    staged_date  = staged_ts[:10] if staged_ts else "unknown"
+
+    console.print()
+    console.print(build_header_panel(booted_date, staged_date, booted_digest, staged_digest))
+
+    with console.status("[bold blue]Fetching releases from GitHub…"):
+        releases = fetch_releases()
+
+    current_release = find_release_for_date(releases, booted_date)
+    staged_release  = find_release_for_date(releases, staged_date)
+
+    if not staged_release:
+        console.print(f"[red]No GitHub release found near staged date {staged_date}.[/red]")
+        for r in releases[:10]:
+            console.print(f"  {r['tag_name']}  ({r['published_at'][:10]})")
+        sys.exit(1)
+
+    body           = staged_release.get("body", "")
+    key_components = parse_key_components(body)
+
+    summary = ""
+    for line in body.splitlines():
+        s = line.strip()
+        if s.startswith("**") and any(w in s for w in ["updated", "added", "removed"]):
+            summary = re.sub(r'\*+', '', s).strip()
+            break
+
+    console.print(Panel(
+        build_components_table(key_components) if key_components
+        else Text("No component version table found.", style="dim"),
+        title=(f"[bold]Release Notes: [cyan]{staged_release['tag_name']}[/cyan][/bold]"
+               + (f"  [dim]{summary}[/dim]" if summary else "")),
+        border_style="cyan", padding=(1, 2)
+    ))
+
+    # SBOM
+    sbom_note = None
+    from_tag  = None
+    if not current_release:
+        earliest      = releases[-1]["tag_name"] if releases else "none"
+        current_release = releases[-1]
+        from_tag      = current_release["tag_name"]
+        sbom_note     = (
+            f"[yellow]Booted image ({booted_date}) predates release automation "
+            f"(first release: [bold]{earliest}[/bold]).[/yellow]\n"
+            f"[dim]Showing diff from nearest available baseline.[/dim]"
+        )
+    else:
+        from_tag = current_release["tag_name"]
+
+    with console.status(f"[bold blue]Downloading SBOM: {current_release['tag_name']}…"):
+        current_sbom = download_sbom(current_release)
+    with console.status(f"[bold blue]Downloading SBOM: {staged_release['tag_name']}…"):
+        staged_sbom  = download_sbom(staged_release)
+
+    changed = added = removed = {}
+    if current_sbom and staged_sbom:
+        current_pkgs = extract_packages(current_sbom)
+        staged_pkgs  = extract_packages(staged_sbom)
+        added, removed, changed = diff_packages(current_pkgs, staged_pkgs)
+
+    diff_panels = build_diff_panels(changed, added, removed)
+    if not diff_panels:
+        diff_panels = [Text("No package differences found between the two SBOMs.", style="dim")]
+
+    inner = []
+    if sbom_note:
+        inner.append(Text.from_markup(sbom_note))
+        inner.append(Rule(style="dim"))
+    inner.extend(diff_panels)
+
+    console.print(Panel(
+        Group(*inner),
+        title=(f"[bold]Package Diff[/bold]  "
+               f"[dim]{from_tag} → {staged_release['tag_name']}[/dim]"),
+        border_style="magenta", padding=(1, 2)
+    ))
+
+    footer = Table.grid(padding=(0, 2))
+    footer.add_column(style="dim")
+    footer.add_column(style="blue underline")
+    footer.add_row("Full changelog", "https://docs.projectbluefin.io/changelogs")
+    footer.add_row("Release page",
+                   f"https://github.com/{REPO}/releases/tag/{staged_release['tag_name']}")
+    console.print(Panel(footer, border_style="dim", padding=(0, 2)))
+
+    if args.html:
+        generate_html(
+            booted_date, staged_date, booted_digest, staged_digest,
+            staged_release, key_components,
+            changed, added, removed,
+            sbom_note, from_tag, staged_release["tag_name"],
+            args.html
+        )
+
+
+if __name__ == "__main__":
+    main()
