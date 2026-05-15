@@ -760,7 +760,7 @@ def generate_html(
 
     with open(output_path, "w") as f:
         f.write(page)
-    print(f"HTML written to {output_path}")
+    return output_path
 
 
 # ── Rich TUI helpers ──────────────────────────────────────────────────────────
@@ -944,16 +944,19 @@ def main():
     html_path = args.html
     if args.open and not html_path:
         import tempfile
-        html_path = tempfile.mktemp(suffix=".html", prefix="bluefin-changelog-")
+        fd, html_path = tempfile.mkstemp(suffix=".html", prefix="bluefin-changelog-")
+        os.close(fd)
 
     if html_path:
-        generate_html(
+        out = generate_html(
             booted_date, staged_date, booted_digest, staged_digest,
             staged_release, key_components,
             changed, added, removed,
             sbom_note, from_tag, staged_release["tag_name"],
             html_path
         )
+        if args.html:
+            console.print(f"[dim]HTML written to {out}[/dim]")
         if args.open:
             subprocess.Popen(["xdg-open", html_path])
 
