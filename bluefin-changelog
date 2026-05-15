@@ -391,6 +391,7 @@ a.chipChanged_q9Uf:hover {
 def parse_args():
     p = argparse.ArgumentParser(description="Show Bluefin Dakota pending update changelog")
     p.add_argument("--html", metavar="FILE", help="Export to HTML file instead of terminal")
+    p.add_argument("--open", action="store_true", help="Generate HTML and open in browser")
     return p.parse_args()
 
 
@@ -940,14 +941,21 @@ def main():
                    f"https://github.com/{REPO}/releases/tag/{staged_release['tag_name']}")
     console.print(Panel(footer, border_style="dim", padding=(0, 2)))
 
-    if args.html:
+    html_path = args.html
+    if args.open and not html_path:
+        import tempfile
+        html_path = tempfile.mktemp(suffix=".html", prefix="bluefin-changelog-")
+
+    if html_path:
         generate_html(
             booted_date, staged_date, booted_digest, staged_digest,
             staged_release, key_components,
             changed, added, removed,
             sbom_note, from_tag, staged_release["tag_name"],
-            args.html
+            html_path
         )
+        if args.open:
+            subprocess.Popen(["xdg-open", html_path])
 
 
 if __name__ == "__main__":
