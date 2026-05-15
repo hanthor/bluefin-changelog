@@ -46,6 +46,15 @@ def detect_variant(image_url):
     if "ublue-os/bluefin" in image_url and "lts" in image_url:
         return "lts"
     return None
+
+def detect_variant_from_tag(tag):
+    """Infer variant from a release tag string."""
+    if tag.startswith("lts."):
+        return "lts"
+    # YYYY-MM-DD-<sha> → dakota
+    if re.match(r'^\d{4}-\d{2}-\d{2}-', tag):
+        return "dakota"
+    return None
 HASH_RE = re.compile(r'^[0-9a-f]{40,}$')
 INTERESTING_SOURCES = {"git_repo", "tar", "remote", "zip", "docker"}
 
@@ -412,9 +421,13 @@ a.chipChanged_q9Uf:hover {
 # ── Data helpers ──────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Show Bluefin Dakota pending update changelog")
+    p = argparse.ArgumentParser(description="Show Bluefin pending update changelog")
     p.add_argument("--html", metavar="FILE", help="Export to HTML file instead of terminal")
     p.add_argument("--open", action="store_true", help="Generate HTML and open in browser")
+    p.add_argument("--from", dest="from_tag", metavar="TAG",
+                   help="Simulate: use this release as the baseline (e.g. lts.20260505)")
+    p.add_argument("--to", dest="to_tag", metavar="TAG",
+                   help="Simulate: use this release as the update (e.g. lts.20260511)")
     return p.parse_args()
 
 
@@ -1004,48 +1017,92 @@ def main():
     args = parse_args()
     console = Console()
 
-    with console.status("[bold blue]Querying bootc status…"):
-        status = get_bootc_status()
+    simulated = bool(args.from_tag or args.to_tag)
 
-    booted = status["status"].get("booted", {})
-    staged = status["status"].get("staged", {})
+    if simulated:
+        # ── Simulation mode: skip bootc, use explicit tags ──
+        if not args.from_tag or not args.to_tag:
+            console.print("[red]--from and --to must be used together.[/red]")
+            sys.exit(1)
 
-    if not staged:
-        console.print(Panel("[green]No staged update — you are up to date.[/green]",
-                            border_style="green"))
-        return
+        variant = detect_variant_from_tag(args.to_tag)
+        if not variant:
+            variant = detect_variant_from_tag(args.from_tag)
+        if not variant:
+            console.print(f"[red]Cannot detect variant from tags:[/red] {args.from_tag!r} / {args.to_tag!r}")
+            console.print("[dim]Expected lts.YYYYMMDD or YYYY-MM-DD-<sha>[/dim]")
+            sys.exit(1)
+        variant_cfg = VARIANTS[variant]
 
-    # ── Variant detection ──
-    image_url = booted.get("image", {}).get("image", {}).get("image", "")
-    variant   = detect_variant(image_url)
-    if not variant:
-        console.print(f"[red]Unsupported image:[/red] {image_url}")
-        console.print("[dim]Supported: projectbluefin/dakota, ublue-os/bluefin*:lts[/dim]")
-        sys.exit(1)
-    variant_cfg = VARIANTS[variant]
+        booted_date = booted_digest = args.from_tag
+        staged_date = staged_digest = args.to_tag
 
-    booted_ts     = booted.get("image", {}).get("timestamp", "")
-    staged_ts     = staged.get("image", {}).get("timestamp", "")
-    booted_digest = booted.get("image", {}).get("imageDigest", "").removeprefix("sha256:")[:20]
-    staged_digest = staged.get("image", {}).get("imageDigest", "").removeprefix("sha256:")[:20]
-    booted_date   = booted_ts[:10] if booted_ts else "unknown"
-    staged_date   = staged_ts[:10] if staged_ts else "unknown"
+        console.print()
+        t = Table.grid(padding=(0, 2))
+        t.add_column(style="dim")
+        t.add_column()
+        t.add_row("From", f"[cyan]{args.from_tag}[/cyan]")
+        t.add_row("To",   f"[green bold]{args.to_tag}[/green bold]")
+        console.print(Panel(t,
+            title=f"[bold]{variant_cfg['label']} — Simulated Diff[/bold]",
+            border_style="yellow", padding=(1, 2)))
 
-    console.print()
-    console.print(build_header_panel(booted_date, staged_date, booted_digest, staged_digest,
-                                     label=variant_cfg["label"]))
+        with console.status("[bold blue]Fetching releases from GitHub…"):
+            releases = fetch_releases(variant_cfg)
 
-    with console.status("[bold blue]Fetching releases from GitHub…"):
-        releases = fetch_releases(variant_cfg)
+        current_release = next((r for r in releases if r["tag_name"] == args.from_tag), None)
+        staged_release  = next((r for r in releases if r["tag_name"] == args.to_tag),   None)
 
-    current_release = find_release_for_date(releases, booted_date, variant)
-    staged_release  = find_release_for_date(releases, staged_date, variant)
+        if not current_release:
+            console.print(f"[red]Release not found:[/red] {args.from_tag}")
+            sys.exit(1)
+        if not staged_release:
+            console.print(f"[red]Release not found:[/red] {args.to_tag}")
+            sys.exit(1)
 
-    if not staged_release:
-        console.print(f"[red]No GitHub release found near staged date {staged_date}.[/red]")
-        for r in releases[:10]:
-            console.print(f"  {r['tag_name']}  ({r['published_at'][:10]})")
-        sys.exit(1)
+    else:
+        # ── Live mode: read from bootc ──
+        with console.status("[bold blue]Querying bootc status…"):
+            status = get_bootc_status()
+
+        booted = status["status"].get("booted", {})
+        staged = status["status"].get("staged", {})
+
+        if not staged:
+            console.print(Panel("[green]No staged update — you are up to date.[/green]",
+                                border_style="green"))
+            return
+
+        image_url = booted.get("image", {}).get("image", {}).get("image", "")
+        variant   = detect_variant(image_url)
+        if not variant:
+            console.print(f"[red]Unsupported image:[/red] {image_url}")
+            console.print("[dim]Supported: projectbluefin/dakota, ublue-os/bluefin*:lts[/dim]")
+            sys.exit(1)
+        variant_cfg = VARIANTS[variant]
+
+        booted_ts     = booted.get("image", {}).get("timestamp", "")
+        staged_ts     = staged.get("image", {}).get("timestamp", "")
+        booted_digest = booted.get("image", {}).get("imageDigest", "").removeprefix("sha256:")[:20]
+        staged_digest = staged.get("image", {}).get("imageDigest", "").removeprefix("sha256:")[:20]
+        booted_date   = booted_ts[:10] if booted_ts else "unknown"
+        staged_date   = staged_ts[:10] if staged_ts else "unknown"
+
+        console.print()
+        console.print(build_header_panel(booted_date, staged_date, booted_digest, staged_digest,
+                                         label=variant_cfg["label"]))
+
+        with console.status("[bold blue]Fetching releases from GitHub…"):
+            releases = fetch_releases(variant_cfg)
+
+        current_release = find_release_for_date(releases, booted_date, variant)
+        staged_release  = find_release_for_date(releases, staged_date, variant)
+
+        if not staged_release:
+            console.print(f"[red]No GitHub release found near staged date {staged_date}.[/red]")
+            for r in releases[:10]:
+                console.print(f"  {r['tag_name']}  ({r['published_at'][:10]})")
+            sys.exit(1)
 
     repo      = variant_cfg["repo"]
     body      = staged_release.get("body", "")
