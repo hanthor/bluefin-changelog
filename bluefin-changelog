@@ -19,12 +19,44 @@ from rich import box
 from rich.text import Text
 from rich.rule import Rule
 
-REPO = "projectbluefin/dakota"
 API_BASE = "https://api.github.com/repos"
+
+# ── Variant config ────────────────────────────────────────────────────────────
+VARIANTS = {
+    "dakota": {
+        "repo":       "projectbluefin/dakota",
+        "label":      "Bluefin Dakota",
+        "color":      "#7c3aed",
+        "image_img":  "https://docs.projectbluefin.io/assets/images/dakotaraptor-debfce4b1b8f804ed609386a7bbbd635.webp",
+        "has_sbom":   True,
+    },
+    "lts": {
+        "repo":       "ublue-os/bluefin-lts",
+        "label":      "Bluefin LTS",
+        "color":      "#d97706",
+        "image_img":  "https://docs.projectbluefin.io/assets/images/bluefin-small-9d455ca0cf21463a3f609949edd27815.webp",
+        "has_sbom":   False,
+    },
+}
+
+def detect_variant(image_url):
+    """Detect the Bluefin variant from the image URL in bootc status."""
+    if "projectbluefin/dakota" in image_url:
+        return "dakota"
+    if "ublue-os/bluefin" in image_url and "lts" in image_url:
+        return "lts"
+    return None
+
+def detect_variant_from_tag(tag):
+    """Infer variant from a release tag string."""
+    if tag.startswith("lts."):
+        return "lts"
+    # YYYY-MM-DD-<sha> → dakota
+    if re.match(r'^\d{4}-\d{2}-\d{2}-', tag):
+        return "dakota"
+    return None
 HASH_RE = re.compile(r'^[0-9a-f]{40,}$')
 INTERESTING_SOURCES = {"git_repo", "tar", "remote", "zip", "docker"}
-
-DAKOTA_IMG = "https://docs.projectbluefin.io/assets/images/dakotaraptor-debfce4b1b8f804ed609386a7bbbd635.webp"
 
 # ── Per-component link resolver ───────────────────────────────────────────────
 #  Each entry: release_url(ver) and compare_url(old, new)
@@ -389,9 +421,13 @@ a.chipChanged_q9Uf:hover {
 # ── Data helpers ──────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Show Bluefin Dakota pending update changelog")
+    p = argparse.ArgumentParser(description="Show Bluefin pending update changelog")
     p.add_argument("--html", metavar="FILE", help="Export to HTML file instead of terminal")
     p.add_argument("--open", action="store_true", help="Generate HTML and open in browser")
+    p.add_argument("--from", dest="from_tag", metavar="TAG",
+                   help="Simulate: use this release as the baseline (e.g. lts.20260505)")
+    p.add_argument("--to", dest="to_tag", metavar="TAG",
+                   help="Simulate: use this release as the update (e.g. lts.20260511)")
     return p.parse_args()
 
 
@@ -421,9 +457,12 @@ def _cache_get(key, max_age_s=3600):
     return None
 
 def _cache_put(key, data):
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    with open(_cache_path(key), "w") as f:
-        json.dump(data, f)
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(_cache_path(key), "w") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
 
 def fetch_json(url, cache_key=None, max_age_s=3600):
     if cache_key:
@@ -440,22 +479,82 @@ def fetch_json(url, cache_key=None, max_age_s=3600):
     return data
 
 
-def fetch_releases():
-    return fetch_json(f"{API_BASE}/{REPO}/releases?per_page=30",
-                      cache_key="releases", max_age_s=1800)
+def fetch_releases(variant_cfg):
+    repo = variant_cfg["repo"]
+    return fetch_json(f"{API_BASE}/{repo}/releases?per_page=30",
+                      cache_key=f"releases_{repo.replace('/', '_')}", max_age_s=1800)
 
 
-def find_release_for_date(releases, date_str):
-    for r in releases:
-        if r["tag_name"].startswith(date_str):
-            return r
-    dt = datetime.strptime(date_str, "%Y-%m-%d")
-    for delta in [1, -1, 2, -2, 3, -3, 4, -4]:
-        candidate = (dt + timedelta(days=delta)).strftime("%Y-%m-%d")
+def find_release_for_date(releases, date_str, variant):
+    """Find the release matching date_str, handling each variant's tag format."""
+    if variant == "lts":
+        # LTS tags: lts.YYYYMMDD
+        target = "lts." + date_str.replace("-", "")
         for r in releases:
-            if r["tag_name"].startswith(candidate):
+            if r["tag_name"] == target:
                 return r
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        for delta in [1, -1, 2, -2, 3, -3, 4, -4]:
+            candidate = "lts." + (dt + timedelta(days=delta)).strftime("%Y%m%d")
+            for r in releases:
+                if r["tag_name"] == candidate:
+                    return r
+    else:
+        # Dakota tags: YYYY-MM-DD-<sha>
+        for r in releases:
+            if r["tag_name"].startswith(date_str):
+                return r
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        for delta in [1, -1, 2, -2, 3, -3, 4, -4]:
+            candidate = (dt + timedelta(days=delta)).strftime("%Y-%m-%d")
+            for r in releases:
+                if r["tag_name"].startswith(candidate):
+                    return r
     return None
+
+
+def parse_lts_body(body):
+    """Parse LTS release body into {section: {changed, added, removed}}.
+
+    Sections are e.g. "bluefin", "bluefin-dx".
+    changed[name] = (old_ver, new_ver)
+    added[name] = ver
+    removed[name] = ver
+    """
+    result = {}
+    section = None
+    subsection = None
+
+    for line in body.splitlines():
+        s = line.strip()
+        if s.startswith("## 📦"):
+            name = s.replace("## 📦", "").replace("Packages", "").strip()
+            section = name
+            result[section] = {"changed": {}, "added": {}, "removed": {}}
+            subsection = None
+        elif s.startswith("### ❌"):
+            subsection = "removed"
+        elif s.startswith("### 🔄"):
+            subsection = "changed"
+        elif s.startswith("### ✨"):
+            subsection = "added"
+        elif s.startswith("|") and "---" not in s and "Package" not in s:
+            if not section or not subsection:
+                continue
+            parts = [p.strip() for p in s.strip("|").split("|")]
+            if len(parts) < 2:
+                continue
+            pkg = parts[0].strip()
+            ver_field = parts[1].strip()
+            if not pkg:
+                continue
+            if subsection == "changed" and "➡️" in ver_field:
+                old, new = ver_field.split("➡️", 1)
+                result[section]["changed"][pkg] = (old.strip(), new.strip())
+            else:
+                result[section][subsection][pkg] = ver_field
+
+    return result
 
 
 def download_sbom(release):
@@ -610,111 +709,113 @@ def diff_section_html(label, count_class, rows_html, cols):
 
 def generate_html(
     booted_date, staged_date, booted_digest, staged_digest,
-    staged_release, key_components,
+    staged_release, variant_cfg,
+    key_components,
     changed, added, removed,
     sbom_note, from_tag, to_tag,
+    lts_sections,
     output_path
 ):
-    tag     = staged_release["tag_name"]
-    gh_url  = f"https://github.com/{REPO}/releases/tag/{tag}"
+    tag      = staged_release["tag_name"]
+    repo     = variant_cfg["repo"]
+    label    = variant_cfg["label"]
+    img_src  = variant_cfg["image_img"]
+    gh_url   = f"https://github.com/{repo}/releases/tag/{tag}"
     docs_url = "https://docs.projectbluefin.io/changelogs"
 
-    # ── Component chips ──
-    chips = []
-    for name, info in key_components.items():
-        ver    = info["version"]
-        change = info["change"]
-        if "→" in change:
-            old_ver = change.split("→")[0].strip().strip("`")
+    # ── Component chips (Dakota only) ──
+    components_section = ""
+    if key_components:
+        chips = []
+        for name, info in key_components.items():
+            ver    = info["version"]
+            change = info["change"]
+            old_ver = change.split("→")[0].strip().strip("`") if "→" in change else None
             chips.append(chip_html(name, ver, old_ver=old_ver))
-        else:
-            chips.append(chip_html(name, ver))
+        components_section = f"""
+  <section class="section">
+    <h2 class="section-heading">Component Versions</h2>
+    <div class="chipsRow_wIOg">{"".join(chips)}</div>
+    <p style="margin-top:.75rem;font-size:.75rem;color:var(--ifm-color-emphasis-600)">
+      Highlighted chips have changed — click to view the diff or changelog.
+    </p>
+  </section>"""
 
-    # ── SBOM note banner ──
-    sbom_banner = ""
-    if sbom_note:
-        sbom_banner = (
-            f'<div class="sbom-note">'
-            f'<strong>⚠ SBOM baseline note:</strong> Your running image ({h(booted_date)}) '
-            f'predates the release automation — no SBOM exists for it. '
-            f'Diff shown is <code>{h(from_tag)}</code> → <code>{h(to_tag)}</code>, '
-            f'the nearest available baseline.'
-            f'</div>'
-        )
-
-    # ── Package diff tables ──
-
-    # Updated
-    updated_rows = []
-    for name in sorted(changed):
-        old, new = changed[name]
-        link_info = sbom_pkg_link(name)
-        link_cell = ""
-        if link_info:
-            _, repo, tag_fn = link_info
-            url = f"https://github.com/{repo}/compare/{tag_fn(old)}...{tag_fn(new)}"
-            link_cell = f'<a href="{h(url)}" target="_blank">diff ↗</a>'
-        updated_rows.append(
-            f'<tr>'
-            f'<td class="pkg-name">{h(name)}</td>'
-            f'<td class="ver-old">{h(old)}</td>'
-            f'<td class="ver-new">{h(new)}</td>'
-            f'<td class="diff-link">{link_cell}</td>'
-            f'</tr>'
-        )
-
-    # Added
-    added_rows = []
-    for name in sorted(added):
-        ver = added[name]
-        link_info = sbom_pkg_link(name)
-        link_cell = ""
-        if link_info:
-            _, repo, tag_fn = link_info
-            url = f"https://github.com/{repo}/releases/tag/{tag_fn(ver)}"
-            link_cell = f'<a href="{h(url)}" target="_blank">release ↗</a>'
-        added_rows.append(
-            f'<tr>'
-            f'<td class="pkg-name">{h(name)}</td>'
-            f'<td class="ver-add">{h(ver)}</td>'
-            f'<td class="diff-link">{link_cell}</td>'
-            f'</tr>'
-        )
-
-    # Removed
-    removed_rows = []
-    for name in sorted(removed):
-        removed_rows.append(
-            f'<tr>'
-            f'<td class="pkg-name">{h(name)}</td>'
-            f'<td class="ver-rem">{h(removed[name])}</td>'
-            f'<td class="diff-link"></td>'
-            f'</tr>'
-        )
-
-    diff_html = ""
-    if not updated_rows and not added_rows and not removed_rows:
-        diff_html = '<p style="color:var(--ifm-color-emphasis-600);font-size:.85rem">No package differences found between the two SBOMs.</p>'
+    # ── Diff section ──
+    if lts_sections is not None:
+        diff_heading = "Package Changes"
+        diff_content = lts_diff_html(lts_sections)
+        sbom_banner  = ""
     else:
-        diff_html += diff_section_html("Updated", "updated", updated_rows, ["Package", "Old", "New", ""])
-        diff_html += diff_section_html("Added",   "added",   added_rows,   ["Package", "Version", ""])
-        diff_html += diff_section_html("Removed", "removed", removed_rows, ["Package", "Version", ""])
+        diff_heading = "Package Diff (SBOM)"
+        sbom_banner  = ""
+        if sbom_note:
+            sbom_banner = (
+                f'<div class="sbom-note">'
+                f'<strong>⚠ SBOM baseline note:</strong> Your running image ({h(booted_date)}) '
+                f'predates the release automation — no SBOM exists for it. '
+                f'Diff shown is <code>{h(from_tag)}</code> → <code>{h(to_tag)}</code>, '
+                f'the nearest available baseline.'
+                f'</div>'
+            )
+        updated_rows = []
+        for name in sorted(changed):
+            old, new = changed[name]
+            link_info = sbom_pkg_link(name)
+            link_cell = ""
+            if link_info:
+                _, pkg_repo, tag_fn = link_info
+                url = f"https://github.com/{pkg_repo}/compare/{tag_fn(old)}...{tag_fn(new)}"
+                link_cell = f'<a href="{h(url)}" target="_blank">diff ↗</a>'
+            updated_rows.append(
+                f'<tr><td class="pkg-name">{h(name)}</td>'
+                f'<td class="ver-old">{h(old)}</td>'
+                f'<td class="ver-new">{h(new)}</td>'
+                f'<td class="diff-link">{link_cell}</td></tr>'
+            )
+        added_rows = []
+        for name in sorted(added):
+            ver = added[name]
+            link_info = sbom_pkg_link(name)
+            link_cell = ""
+            if link_info:
+                _, pkg_repo, tag_fn = link_info
+                url = f"https://github.com/{pkg_repo}/releases/tag/{tag_fn(ver)}"
+                link_cell = f'<a href="{h(url)}" target="_blank">release ↗</a>'
+            added_rows.append(
+                f'<tr><td class="pkg-name">{h(name)}</td>'
+                f'<td class="ver-add">{h(ver)}</td>'
+                f'<td class="diff-link">{link_cell}</td></tr>'
+            )
+        removed_rows = [
+            f'<tr><td class="pkg-name">{h(n)}</td>'
+            f'<td class="ver-rem">{h(v)}</td>'
+            f'<td class="diff-link"></td></tr>'
+            for n, v in sorted(removed.items())
+        ]
+        if not updated_rows and not added_rows and not removed_rows:
+            diff_content = '<p style="color:var(--ifm-color-emphasis-600);font-size:.85rem">No package differences found between the two SBOMs.</p>'
+        else:
+            diff_content = (
+                diff_section_html("Updated", "updated", updated_rows, ["Package", "Old", "New", ""]) +
+                diff_section_html("Added",   "added",   added_rows,   ["Package", "Version", ""]) +
+                diff_section_html("Removed", "removed", removed_rows, ["Package", "Version", ""])
+            )
 
     page = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Bluefin Dakota — Pending Update {h(tag)}</title>
+<title>{h(label)} — Pending Update {h(tag)}</title>
 <style>{HTML_CSS}</style>
 </head>
 <body>
 <div class="page">
 
-  <!-- ── Page header ── -->
   <header class="page-header">
     <div class="page-header-left">
-      <h1 class="page-title">Bluefin Dakota</h1>
+      <h1 class="page-title">{h(label)}</h1>
       <p class="page-subtitle">Pending update — {h(format_date(staged_date))}</p>
       <div class="digest-row">
         <span class="date">{h(booted_date)}</span>
@@ -727,28 +828,17 @@ def generate_html(
         </span>
       </div>
     </div>
-    <img src="{DAKOTA_IMG}" alt="Dakotaraptor" width="96" height="96">
+    <img src="{h(img_src)}" alt="{h(label)}" width="96" height="96">
   </header>
 
-  <!-- ── Component versions ── -->
-  <section class="section">
-    <h2 class="section-heading">Component Versions</h2>
-    <div class="chipsRow_wIOg">
-      {"".join(chips)}
-    </div>
-    <p style="margin-top:.75rem;font-size:.75rem;color:var(--ifm-color-emphasis-600)">
-      Highlighted chips have changed — click to view the diff or changelog.
-    </p>
-  </section>
+  {components_section}
 
-  <!-- ── Package diff ── -->
   <section class="section">
-    <h2 class="section-heading">Package Diff (SBOM)</h2>
+    <h2 class="section-heading">{h(diff_heading)}</h2>
     {sbom_banner}
-    {diff_html}
+    {diff_content}
   </section>
 
-  <!-- ── Footer ── -->
   <div class="page-footer">
     <a href="{docs_url}" class="viewLink_xgng" target="_blank">Full changelog →</a>
     <a href="{h(gh_url)}" class="viewLink_xgng" target="_blank">View on GitHub →</a>
@@ -765,13 +855,14 @@ def generate_html(
 
 # ── Rich TUI helpers ──────────────────────────────────────────────────────────
 
-def build_header_panel(booted_date, staged_date, booted_digest, staged_digest):
+def build_header_panel(booted_date, staged_date, booted_digest, staged_digest,
+                       label="Bluefin"):
     t = Table.grid(padding=(0, 2))
     t.add_column(style="dim")
     t.add_column()
     t.add_row("Current", f"[cyan]{booted_date}[/cyan]  [dim]{booted_digest}…[/dim]")
     t.add_row("Staged",  f"[green bold]{staged_date}[/green bold]  [dim]{staged_digest}…[/dim]")
-    return Panel(t, title="[bold]Bluefin Dakota — Pending Update[/bold]",
+    return Panel(t, title=f"[bold]{label} — Pending Update[/bold]",
                  border_style="blue", padding=(1, 2))
 
 
@@ -833,112 +924,280 @@ def build_diff_panels(changed, added, removed):
     return panels
 
 
+# ── LTS TUI helpers ───────────────────────────────────────────────────────────
+
+def build_lts_panels(lts_sections):
+    """Build Rich panels from parsed LTS release body sections."""
+    panels = []
+    for section_name, data in lts_sections.items():
+        changed = data.get("changed", {})
+        added   = data.get("added", {})
+        removed = data.get("removed", {})
+        if not changed and not added and not removed:
+            continue
+        inner = []
+        if changed:
+            t = Table(box=box.SIMPLE_HEAD, header_style="bold yellow", show_header=True)
+            t.add_column("Package", style="bold", min_width=28)
+            t.add_column("Old", style="dim red", min_width=22)
+            t.add_column("New", style="green bold", min_width=22)
+            for name in sorted(changed):
+                old, new = changed[name]
+                t.add_row(name, old, new)
+            inner.append(Panel(t, title=f"[yellow bold]Changed ({len(changed)})[/yellow bold]",
+                               border_style="yellow"))
+        if added:
+            t = Table(box=box.SIMPLE_HEAD, header_style="bold green", show_header=True)
+            t.add_column("Package", style="bold", min_width=28)
+            t.add_column("Version", style="green", min_width=22)
+            for name in sorted(added):
+                t.add_row(name, added[name])
+            inner.append(Panel(t, title=f"[green bold]Added ({len(added)})[/green bold]",
+                               border_style="green"))
+        if removed:
+            t = Table(box=box.SIMPLE_HEAD, header_style="bold red", show_header=True)
+            t.add_column("Package", style="bold", min_width=28)
+            t.add_column("Version", style="dim red", min_width=22)
+            for name in sorted(removed):
+                t.add_row(name, removed[name])
+            inner.append(Panel(t, title=f"[red bold]Removed ({len(removed)})[/red bold]",
+                               border_style="red"))
+        panels.append(Panel(Group(*inner),
+                            title=f"[bold cyan]{section_name} Packages[/bold cyan]",
+                            border_style="cyan", padding=(0, 1)))
+    return panels
+
+
+def lts_diff_html(lts_sections):
+    """Generate the diff HTML for an LTS release (replaces SBOM diff)."""
+    parts = []
+    for section_name, data in lts_sections.items():
+        changed = data.get("changed", {})
+        added   = data.get("added", {})
+        removed = data.get("removed", {})
+        if not changed and not added and not removed:
+            continue
+
+        parts.append(f'<h3 style="font-size:.9rem;font-weight:700;color:var(--ifm-color-emphasis-700);'
+                     f'margin:1.5rem 0 .5rem;padding-bottom:.3rem;'
+                     f'border-bottom:1px solid var(--ifm-color-emphasis-200)">'
+                     f'{h(section_name)} Packages</h3>')
+
+        updated_rows = [
+            f'<tr><td class="pkg-name">{h(n)}</td>'
+            f'<td class="ver-old">{h(o)}</td>'
+            f'<td class="ver-new">{h(nw)}</td>'
+            f'<td class="diff-link"></td></tr>'
+            for n, (o, nw) in sorted(changed.items())
+        ]
+        added_rows = [
+            f'<tr><td class="pkg-name">{h(n)}</td>'
+            f'<td class="ver-add">{h(v)}</td>'
+            f'<td class="diff-link"></td></tr>'
+            for n, v in sorted(added.items())
+        ]
+        removed_rows = [
+            f'<tr><td class="pkg-name">{h(n)}</td>'
+            f'<td class="ver-rem">{h(v)}</td>'
+            f'<td class="diff-link"></td></tr>'
+            for n, v in sorted(removed.items())
+        ]
+        parts.append(diff_section_html("Changed", "updated", updated_rows, ["Package", "Old", "New", ""]))
+        parts.append(diff_section_html("Added",   "added",   added_rows,   ["Package", "Version", ""]))
+        parts.append(diff_section_html("Removed", "removed", removed_rows, ["Package", "Version", ""]))
+
+    if not parts:
+        return '<p style="color:var(--ifm-color-emphasis-600);font-size:.85rem">No package changes in this release.</p>'
+    return "\n".join(parts)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     args = parse_args()
     console = Console()
 
-    with console.status("[bold blue]Querying bootc status…"):
-        status = get_bootc_status()
+    simulated = bool(args.from_tag or args.to_tag)
 
-    booted = status["status"].get("booted", {})
-    staged = status["status"].get("staged", {})
+    if simulated:
+        # ── Simulation mode: skip bootc, use explicit tags ──
+        if not args.from_tag or not args.to_tag:
+            console.print("[red]--from and --to must be used together.[/red]")
+            sys.exit(1)
 
-    if not staged:
-        console.print(Panel("[green]No staged update — you are up to date.[/green]",
-                            border_style="green"))
-        return
+        variant = detect_variant_from_tag(args.to_tag)
+        if not variant:
+            variant = detect_variant_from_tag(args.from_tag)
+        if not variant:
+            console.print(f"[red]Cannot detect variant from tags:[/red] {args.from_tag!r} / {args.to_tag!r}")
+            console.print("[dim]Expected lts.YYYYMMDD or YYYY-MM-DD-<sha>[/dim]")
+            sys.exit(1)
+        variant_cfg = VARIANTS[variant]
 
-    booted_ts    = booted.get("image", {}).get("timestamp", "")
-    staged_ts    = staged.get("image", {}).get("timestamp", "")
-    booted_digest = booted.get("image", {}).get("imageDigest", "").removeprefix("sha256:")[:20]
-    staged_digest = staged.get("image", {}).get("imageDigest", "").removeprefix("sha256:")[:20]
-    booted_date  = booted_ts[:10] if booted_ts else "unknown"
-    staged_date  = staged_ts[:10] if staged_ts else "unknown"
+        booted_date = booted_digest = args.from_tag
+        staged_date = staged_digest = args.to_tag
 
-    console.print()
-    console.print(build_header_panel(booted_date, staged_date, booted_digest, staged_digest))
+        console.print()
+        t = Table.grid(padding=(0, 2))
+        t.add_column(style="dim")
+        t.add_column()
+        t.add_row("From", f"[cyan]{args.from_tag}[/cyan]")
+        t.add_row("To",   f"[green bold]{args.to_tag}[/green bold]")
+        console.print(Panel(t,
+            title=f"[bold]{variant_cfg['label']} — Simulated Diff[/bold]",
+            border_style="yellow", padding=(1, 2)))
 
-    with console.status("[bold blue]Fetching releases from GitHub…"):
-        releases = fetch_releases()
+        with console.status("[bold blue]Fetching releases from GitHub…"):
+            releases = fetch_releases(variant_cfg)
 
-    current_release = find_release_for_date(releases, booted_date)
-    staged_release  = find_release_for_date(releases, staged_date)
+        current_release = next((r for r in releases if r["tag_name"] == args.from_tag), None)
+        staged_release  = next((r for r in releases if r["tag_name"] == args.to_tag),   None)
 
-    if not staged_release:
-        console.print(f"[red]No GitHub release found near staged date {staged_date}.[/red]")
-        for r in releases[:10]:
-            console.print(f"  {r['tag_name']}  ({r['published_at'][:10]})")
-        sys.exit(1)
+        if not current_release:
+            console.print(f"[red]Release not found:[/red] {args.from_tag}")
+            sys.exit(1)
+        if not staged_release:
+            console.print(f"[red]Release not found:[/red] {args.to_tag}")
+            sys.exit(1)
 
-    body           = staged_release.get("body", "")
-    key_components = parse_key_components(body)
-
-    summary = ""
-    for line in body.splitlines():
-        s = line.strip()
-        if s.startswith("**") and any(w in s for w in ["updated", "added", "removed"]):
-            summary = re.sub(r'\*+', '', s).strip()
-            break
-
-    console.print(Panel(
-        build_components_table(key_components) if key_components
-        else Text("No component version table found.", style="dim"),
-        title=(f"[bold]Release Notes: [cyan]{staged_release['tag_name']}[/cyan][/bold]"
-               + (f"  [dim]{summary}[/dim]" if summary else "")),
-        border_style="cyan", padding=(1, 2)
-    ))
-
-    # SBOM
-    sbom_note = None
-    from_tag  = None
-    if not current_release:
-        earliest      = releases[-1]["tag_name"] if releases else "none"
-        current_release = releases[-1]
-        from_tag      = current_release["tag_name"]
-        sbom_note     = (
-            f"[yellow]Booted image ({booted_date}) predates release automation "
-            f"(first release: [bold]{earliest}[/bold]).[/yellow]\n"
-            f"[dim]Showing diff from nearest available baseline.[/dim]"
-        )
     else:
-        from_tag = current_release["tag_name"]
+        # ── Live mode: read from bootc ──
+        with console.status("[bold blue]Querying bootc status…"):
+            status = get_bootc_status()
 
-    with console.status(f"[bold blue]Downloading SBOM: {current_release['tag_name']}…"):
-        current_sbom = download_sbom(current_release)
-    with console.status(f"[bold blue]Downloading SBOM: {staged_release['tag_name']}…"):
-        staged_sbom  = download_sbom(staged_release)
+        booted = status["status"].get("booted", {})
+        staged = status["status"].get("staged", {})
 
-    changed = added = removed = {}
-    if current_sbom and staged_sbom:
-        current_pkgs = extract_packages(current_sbom)
-        staged_pkgs  = extract_packages(staged_sbom)
-        added, removed, changed = diff_packages(current_pkgs, staged_pkgs)
+        if not staged:
+            console.print(Panel("[green]No staged update — you are up to date.[/green]",
+                                border_style="green"))
+            return
 
-    diff_panels = build_diff_panels(changed, added, removed)
-    if not diff_panels:
-        diff_panels = [Text("No package differences found between the two SBOMs.", style="dim")]
+        image_url = booted.get("image", {}).get("image", {}).get("image", "")
+        variant   = detect_variant(image_url)
+        if not variant:
+            console.print(f"[red]Unsupported image:[/red] {image_url}")
+            console.print("[dim]Supported: projectbluefin/dakota, ublue-os/bluefin*:lts[/dim]")
+            sys.exit(1)
+        variant_cfg = VARIANTS[variant]
 
-    inner = []
-    if sbom_note:
-        inner.append(Text.from_markup(sbom_note))
-        inner.append(Rule(style="dim"))
-    inner.extend(diff_panels)
+        booted_ts     = booted.get("image", {}).get("timestamp", "")
+        staged_ts     = staged.get("image", {}).get("timestamp", "")
+        booted_digest = booted.get("image", {}).get("imageDigest", "").removeprefix("sha256:")[:20]
+        staged_digest = staged.get("image", {}).get("imageDigest", "").removeprefix("sha256:")[:20]
+        booted_date   = booted_ts[:10] if booted_ts else "unknown"
+        staged_date   = staged_ts[:10] if staged_ts else "unknown"
 
-    console.print(Panel(
-        Group(*inner),
-        title=(f"[bold]Package Diff[/bold]  "
-               f"[dim]{from_tag} → {staged_release['tag_name']}[/dim]"),
-        border_style="magenta", padding=(1, 2)
-    ))
+        console.print()
+        console.print(build_header_panel(booted_date, staged_date, booted_digest, staged_digest,
+                                         label=variant_cfg["label"]))
+
+        with console.status("[bold blue]Fetching releases from GitHub…"):
+            releases = fetch_releases(variant_cfg)
+
+        current_release = find_release_for_date(releases, booted_date, variant)
+        staged_release  = find_release_for_date(releases, staged_date, variant)
+
+        if not staged_release:
+            console.print(f"[red]No GitHub release found near staged date {staged_date}.[/red]")
+            for r in releases[:10]:
+                console.print(f"  {r['tag_name']}  ({r['published_at'][:10]})")
+            sys.exit(1)
+
+    repo      = variant_cfg["repo"]
+    body      = staged_release.get("body", "")
+    gh_url    = f"https://github.com/{repo}/releases/tag/{staged_release['tag_name']}"
+
+    # ── Dakota path ──
+    if variant == "dakota":
+        key_components = parse_key_components(body)
+        summary = ""
+        for line in body.splitlines():
+            s = line.strip()
+            if s.startswith("**") and any(w in s for w in ["updated", "added", "removed"]):
+                summary = re.sub(r'\*+', '', s).strip()
+                break
+
+        console.print(Panel(
+            build_components_table(key_components) if key_components
+            else Text("No component version table found.", style="dim"),
+            title=(f"[bold]Release Notes: [cyan]{staged_release['tag_name']}[/cyan][/bold]"
+                   + (f"  [dim]{summary}[/dim]" if summary else "")),
+            border_style="cyan", padding=(1, 2)
+        ))
+
+        sbom_note = None
+        from_tag  = None
+        if not current_release:
+            earliest        = releases[-1]["tag_name"] if releases else "none"
+            current_release = releases[-1]
+            from_tag        = current_release["tag_name"]
+            sbom_note       = (
+                f"[yellow]Booted image ({booted_date}) predates release automation "
+                f"(first release: [bold]{earliest}[/bold]).[/yellow]\n"
+                f"[dim]Showing diff from nearest available baseline.[/dim]"
+            )
+        else:
+            from_tag = current_release["tag_name"]
+
+        with console.status(f"[bold blue]Downloading SBOM: {current_release['tag_name']}…"):
+            current_sbom = download_sbom(current_release)
+        with console.status(f"[bold blue]Downloading SBOM: {staged_release['tag_name']}…"):
+            staged_sbom  = download_sbom(staged_release)
+
+        changed = added = removed = {}
+        if current_sbom and staged_sbom:
+            current_pkgs = extract_packages(current_sbom)
+            staged_pkgs  = extract_packages(staged_sbom)
+            added, removed, changed = diff_packages(current_pkgs, staged_pkgs)
+
+        diff_panels = build_diff_panels(changed, added, removed)
+        if not diff_panels:
+            diff_panels = [Text("No package differences found between the two SBOMs.", style="dim")]
+
+        inner = []
+        if sbom_note:
+            inner.append(Text.from_markup(sbom_note))
+            inner.append(Rule(style="dim"))
+        inner.extend(diff_panels)
+
+        console.print(Panel(
+            Group(*inner),
+            title=(f"[bold]Package Diff[/bold]  "
+                   f"[dim]{from_tag} → {staged_release['tag_name']}[/dim]"),
+            border_style="magenta", padding=(1, 2)
+        ))
+        lts_sections_for_html = None
+
+    # ── LTS path ──
+    else:
+        lts_sections = parse_lts_body(body)
+        lts_panels   = build_lts_panels(lts_sections)
+
+        if lts_panels:
+            console.print(Panel(
+                Group(*lts_panels),
+                title=f"[bold]Package Changes: [cyan]{staged_release['tag_name']}[/cyan][/bold]",
+                border_style="cyan", padding=(1, 2)
+            ))
+        else:
+            console.print(Panel(
+                Text("No package changes in this release.", style="dim"),
+                title=f"[bold]Package Changes: [cyan]{staged_release['tag_name']}[/cyan][/bold]",
+                border_style="cyan", padding=(1, 2)
+            ))
+
+        key_components = {}
+        changed = added = removed = {}
+        sbom_note = None
+        from_tag  = staged_release["tag_name"]
+        lts_sections_for_html = lts_sections
 
     footer = Table.grid(padding=(0, 2))
     footer.add_column(style="dim")
     footer.add_column(style="blue underline")
     footer.add_row("Full changelog", "https://docs.projectbluefin.io/changelogs")
-    footer.add_row("Release page",
-                   f"https://github.com/{REPO}/releases/tag/{staged_release['tag_name']}")
+    footer.add_row("Release page",   gh_url)
     console.print(Panel(footer, border_style="dim", padding=(0, 2)))
 
     html_path = args.html
@@ -950,9 +1209,11 @@ def main():
     if html_path:
         out = generate_html(
             booted_date, staged_date, booted_digest, staged_digest,
-            staged_release, key_components,
+            staged_release, variant_cfg,
+            key_components,
             changed, added, removed,
             sbom_note, from_tag, staged_release["tag_name"],
+            lts_sections_for_html if variant == "lts" else None,
             html_path
         )
         if args.html:
