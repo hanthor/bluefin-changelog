@@ -20,6 +20,8 @@ from rich.text import Text
 from rich.rule import Rule
 
 API_BASE = "https://api.github.com/repos"
+# Per-socket timeout for every network fetch, so a stalled connection cannot hang the TUI.
+HTTP_TIMEOUT_S = 30
 
 # ── Variant config ────────────────────────────────────────────────────────────
 VARIANTS = {
@@ -472,7 +474,7 @@ def fetch_json(url, cache_key=None, max_age_s=3600):
     req = urllib.request.Request(
         url, headers={"User-Agent": "bluefin-changelog/1.0", "Accept": "application/json"}
     )
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
         data = json.loads(resp.read())
     if cache_key:
         _cache_put(cache_key, data)
@@ -570,7 +572,7 @@ def download_sbom(release):
                 asset["browser_download_url"],
                 headers={"User-Agent": "bluefin-changelog/1.0"}
             )
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
                 data = json.loads(resp.read())
             _cache_put(f"sbom_{tag}", data)
             return data
